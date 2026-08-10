@@ -22,17 +22,38 @@ export async function fetchMetricLeaderboard(
 
   let rawPlayers: Array<{ uuid?: string; username?: string; name?: string; value?: any }> = [];
 
-  // Strategy 1: Dedicated table search (e.g., ajlb_kills, ajleaderboards_kills, ajlb_playtime)
-  const targetTable = tables.find(t => {
+  // Candidate table mappings for each metric
+  const candidateMap: Record<string, string[]> = {
+    kills: ['ajlb_statistic_player_kills', 'ajlb_statistic_kills', 'ajlb_kills', 'ajleaderboards_statistic_player_kills'],
+    deaths: ['ajlb_statistic_deaths', 'ajlb_deaths', 'ajleaderboards_statistic_deaths'],
+    playtime: ['ajlb_statistic_hours_played', 'ajlb_statistic_time_played', 'ajlb_statistic_play_one_minute', 'ajlb_hours', 'ajlb_playtime'],
+    money: ['ajlb_vault_eco_balance_commas', 'ajlb_vault_eco_balance', 'ajlb_money', 'ajlb_balance'],
+    balance: ['ajlb_vault_eco_balance_commas', 'ajlb_vault_eco_balance', 'ajlb_money', 'ajlb_balance'],
+    blocks_broken: ['ajlb_statistic_mine_block', 'ajlb_statistic_blocks_broken', 'ajlb_blocks_broken'],
+    mob_kills: ['ajlb_statistic_mob_kills', 'ajlb_mob_kills'],
+    votes: ['ajlb_votes', 'ajlb_statistic_votes']
+  };
+
+  const metricLower = metric.toLowerCase();
+  let candidateNames = candidateMap[metricLower] || [];
+
+  // Also include any table that contains the metric name or ends with _metric
+  const dynamicCandidates = tables.filter(t => {
     const l = t.toLowerCase();
-    return l === `ajlb_${metric}` || 
-           l === `ajleaderboards_${metric}` || 
-           l.endsWith(`_${metric}`);
+    return l === `ajlb_${metricLower}` ||
+           l === `ajleaderboards_${metricLower}` ||
+           l.endsWith(`_${metricLower}`) ||
+           (l.includes('statistic') && l.includes(metricLower));
   });
+
+  candidateNames = Array.from(new Set([...candidateNames, ...dynamicCandidates]));
+
+  // Find the first candidate table that exists in the database
+  const targetTable = candidateNames.find(c => tables.some(t => t.toLowerCase() === c.toLowerCase()));
 
   const extrasTable = tables.find(t => {
     const l = t.toLowerCase();
-    return l.includes('extras') || l.includes('users') || l.includes('players');
+    return (l.includes('extras') || l.includes('users') || l.includes('players')) && !l.startsWith('ajlb_statistic_');
   });
 
   if (targetTable) {
@@ -41,38 +62,41 @@ export async function fetchMetricLeaderboard(
       const colNames = rawCols.map(c => String(c.Field).toLowerCase());
       
       const valCol = colNames.find(c => ['value', 'score', 'amount', 'stat', 'kills', 'balance', 'deaths'].includes(c)) || colNames[1] || 'value';
-      const nameCol = colNames.find(c => ['name', 'namecache', 'username', 'player', 'player_name'].includes(c));
-      const foreignKey = colNames.find(c => ['user_id', 'uuid', 'id', 'player_id'].includes(c)) || 'user_id';
+      const nameCol = colNames.find(c => ['namecache', 'displaynamecache', 'name', 'username', 'player', 'player_name'].includes(c));
+      const uuidCol = colNames.find(c => ['id', 'uuid', 'player_uuid'].includes(c));
 
-      if (extrasTable && foreignKey) {
-        const [extrasCols] = [await executeReadOnlyQuery(`SHOW COLUMNS FROM \`${extrasTable}\``)];
-        const eCols = extrasCols.map(c => String(c.Field).toLowerCase());
-        const eNameCol = eCols.find(c => ['namecache', 'name', 'username', 'player_name'].includes(c)) || 'namecache';
-        const eUuidCol = eCols.find(c => ['uuid', 'player_uuid'].includes(c));
-        const eIdCol = eCols.find(c => ['user_id', 'id', 'uuid'].includes(c)) || 'user_id';
-
-        const uuidSelect = eUuidCol ? `e.\`${eUuidCol}\`` : `''`;
-
+      // 1. Direct query on the table if it contains username/namecache directly
+      if (nameCol) {
+        const selectUuid = uuidCol ? `\`${uuidCol}\`` : `''`;
         const sql = `
-          SELECT ${uuidSelect} AS uuid, e.\`${eNameCol}\` AS username, s.\`${valCol}\` AS value 
-          FROM \`${targetTable}\` s 
-          INNER JOIN \`${extrasTable}\` e ON s.\`${foreignKey}\` = e.\`${eIdCol}\` 
-          ORDER BY (s.\`${valCol}\` + 0) DESC LIMIT ${batchSize}
-        `;
-
-        const rows = await executeReadOnlyQuery(sql);
-        if (rows.length > 0) {
-          rawPlayers = rows;
-        }
-      }
-
-      if (rawPlayers.length === 0 && nameCol) {
-        const sql = `
-          SELECT '' AS uuid, \`${nameCol}\` AS username, \`${valCol}\` AS value 
+          SELECT ${selectUuid} AS uuid, \`${nameCol}\` AS username, \`${valCol}\` AS value 
           FROM \`${targetTable}\` 
+          WHERE \`${nameCol}\` IS NOT NULL AND \`${nameCol}\` != ''
           ORDER BY (\`${valCol}\` + 0) DESC LIMIT ${batchSize}
         `;
         rawPlayers = await executeReadOnlyQuery(sql);
+      }
+
+      // 2. If direct query yielded no rows and extrasTable exists with name column
+      if (rawPlayers.length === 0 && extrasTable && uuidCol) {
+        try {
+          const extrasCols = await executeReadOnlyQuery(`SHOW COLUMNS FROM \`${extrasTable}\``);
+          const eCols = extrasCols.map(c => String(c.Field).toLowerCase());
+          const eNameCol = eCols.find(c => ['namecache', 'name', 'username', 'player_name', 'placeholder'].includes(c));
+          const eIdCol = eCols.find(c => ['id', 'uuid', 'user_id'].includes(c)) || 'id';
+
+          if (eNameCol) {
+            const sql = `
+              SELECT s.\`${uuidCol}\` AS uuid, e.\`${eNameCol}\` AS username, s.\`${valCol}\` AS value 
+              FROM \`${targetTable}\` s 
+              INNER JOIN \`${extrasTable}\` e ON s.\`${uuidCol}\` = e.\`${eIdCol}\` 
+              ORDER BY (s.\`${valCol}\` + 0) DESC LIMIT ${batchSize}
+            `;
+            rawPlayers = await executeReadOnlyQuery(sql);
+          }
+        } catch (e) {
+          // Ignore join failure
+        }
       }
     } catch (err: any) {
       SyncLogger.warn(`Query for dedicated table "${targetTable}" failed: ${err.message}`);
@@ -87,7 +111,7 @@ export async function fetchMetricLeaderboard(
         const uColsRaw = await executeReadOnlyQuery(`SHOW COLUMNS FROM \`${uTbl}\``);
         const uCols = uColsRaw.map(c => String(c.Field).toLowerCase());
         const boardCol = uCols.find(c => ['board', 'type', 'stat', 'metric', 'category'].includes(c));
-        const nameCol = uCols.find(c => ['name', 'namecache', 'username', 'player'].includes(c)) || 'name';
+        const nameCol = uCols.find(c => ['namecache', 'name', 'username', 'player'].includes(c)) || 'name';
         const valCol = uCols.find(c => ['value', 'score', 'amount', 'stat'].includes(c)) || 'value';
 
         if (boardCol) {

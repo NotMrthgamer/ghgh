@@ -3,7 +3,7 @@ import path from "path";
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import mysql from "mysql2/promise";
-import { runAjLeaderboardsSync, getHealthReport, getDetailedStatusReport, inspectAjlbReport, inspectDatabase } from "./sync-service";
+import { runAjLeaderboardsSync, getHealthReport, getDetailedStatusReport, inspectAjlbReport, inspectDatabase, fetchMetricLeaderboard, executeReadOnlyQuery, getSupabaseClient } from "./sync-service";
 
 const app = express();
 const PORT = 3000;
@@ -892,326 +892,82 @@ app.get("/db-check", async (req, res) => {
 });
 
 app.get("/api/leaderboard/:metric", async (req, res) => {
+  res.setHeader("Content-Type", "application/json");
   const { metric } = req.params;
-  const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 10));
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 10));
 
-  let mysqlData: any[] = [];
-  let connected = false;
-
+  // 1. First attempt: Query Supabase minecraft_leaderboards table
   try {
-    const settingsColl = await getCollection('settings');
-    const globalSettings = settingsColl.find((s: any) => s.id === 'global') || {};
-    
-    const host = globalSettings.mysql_host || 'lemon.nyctohost.com';
-    const port = globalSettings.mysql_port || '3306';
-    const database = globalSettings.mysql_database || 's168_Two';
-    const user = globalSettings.mysql_user || 'u168_50U0Rj2EOa';
-    const password = globalSettings.mysql_password ?? 'm@gOsxCyU2.=DaCka@THfhcf';
+    const supabase = getSupabaseClient();
+    if (supabase) {
+      const { data: supaRows, error: supaErr } = await supabase
+        .from('minecraft_leaderboards')
+        .select('*')
+        .eq('leaderboard_type', metric)
+        .order('score', { ascending: false })
+        .limit(limit);
 
-    if (host && database && user) {
-      const queryMysql = async () => {
-        let connection: any = null;
-        try {
-          const [hostname, defaultPort] = host.includes(':') ? host.split(':') : [host, port || '3306'];
-          connection = await mysql.createConnection({
-            host: hostname,
-            port: Number(defaultPort || 3306),
-            database,
-            user,
-            password: password || '',
-            connectTimeout: 2000
-          });
-
-          if (connection && typeof connection.on === 'function') {
-            connection.on('error', (err: any) => {
-              console.log('MySQL connection error:', err?.message);
-            });
-          }
-
-          connected = true; // Connection succeeded
-
-        // 1. Get list of all tables in user's MySQL database
-        const [rawTables] = await connection.execute('SHOW TABLES');
-        const dbTables: string[] = (Array.isArray(rawTables) ? rawTables : [])
-          .map(r => (r ? String(Object.values(r)[0] || '') : ''))
-          .filter(Boolean);
-        console.log(`Connected to MySQL database "${database}". Found ${dbTables.length} tables:`, dbTables);
-
-        // Find potential user/extras table (e.g. ajlb_extras, ajleaderboards_extras, ajlb_users)
-        const extrasTable = dbTables.find(t => 
-          /^(ajlb_extras|ajleaderboards_extras|ajlb_users|ajleaderboards_users|ajlb_players|aj_extras)$/i.test(t)
-        ) || dbTables.find(t => t.toLowerCase().includes('extras') || t.toLowerCase().includes('users'));
-
-        let extrasNameCol = 'name';
-        let extrasIdCol = 'id';
-        if (extrasTable) {
-          try {
-            const [cols] = await connection.execute(`SHOW COLUMNS FROM \`${extrasTable}\``);
-            const colNames = (Array.isArray(cols) ? cols : []).map(c => (c && c.Field) ? String(c.Field).toLowerCase() : '').filter(Boolean);
-            if (colNames.includes('namecache')) extrasNameCol = 'namecache';
-            else if (colNames.includes('name')) extrasNameCol = 'name';
-            else if (colNames.includes('username')) extrasNameCol = 'username';
-            else if (colNames.includes('player')) extrasNameCol = 'player';
-
-            if (colNames.includes('id')) extrasIdCol = 'id';
-            else if (colNames.includes('uuid')) extrasIdCol = 'uuid';
-          } catch (e) {
-            console.log("Could not inspect extras table columns:", e);
-          }
-        }
-
-        // Keywords for each metric
-        const metricKeywords: Record<string, string[]> = {
-          playtime: ['play', 'hour', 'time', 'tick', 'minute'],
-          kills: ['kill', 'pvp', 'mob'],
-          balance: ['balance', 'vault', 'money', 'eco', 'coin'],
-          deaths: ['death', 'died']
-        };
-
-        const targetKeywords = metricKeywords[metric] || [metric];
-
-        // Filter database tables matching metric keywords
-        const matchedTables = dbTables.filter(t => {
-          const tLower = t.toLowerCase();
-          return targetKeywords.some(kw => tLower.includes(kw));
+      if (!supaErr && Array.isArray(supaRows) && supaRows.length > 0) {
+        const formatted = supaRows.map((r: any, idx: number) => ({
+          rank: r.rank || idx + 1,
+          username: r.player_name || r.player_uuid || `Player${idx + 1}`,
+          value: Number(r.score || 0),
+          uuid: r.player_uuid
+        }));
+        return res.json({
+          success: true,
+          metric,
+          data: formatted,
+          connected: true,
+          source: 'supabase'
         });
-
-        // Also add direct candidate names
-        let tableCandidates: string[] = [...matchedTables];
-        if (metric === 'playtime') {
-          tableCandidates.push('ajlb_statistic_hours_played', 'ajlb_statistic_play_one_minute', 'ajlb_statistic_time_played', 'ajlb_hours', 'ajlb_playtime', 'ajleaderboards_statistic_hours_played', 'ajleaderboards_playtime', 'ajlb_lb_statistic_hours_played');
-        } else if (metric === 'kills') {
-          tableCandidates.push('ajlb_statistic_player_kills', 'ajlb_statistic_kills', 'ajlb_kills', 'ajleaderboards_statistic_player_kills', 'ajleaderboards_kills', 'ajlb_lb_statistic_player_kills');
-        } else if (metric === 'balance') {
-          tableCandidates.push('ajlb_vault_eco_balance', 'ajlb_vault_balance', 'ajlb_money', 'ajlb_balance', 'ajleaderboards_vault_eco_balance', 'ajleaderboards_money', 'ajleaderboards_balance', 'ajlb_lb_vault_eco_balance');
-        } else if (metric === 'deaths') {
-          tableCandidates.push('ajlb_statistic_deaths', 'ajlb_deaths', 'ajleaderboards_statistic_deaths', 'ajleaderboards_deaths', 'ajlb_lb_statistic_deaths');
-        } else {
-          tableCandidates.push(`ajlb_${metric}`, `ajleaderboards_${metric}`, `ajlb_lb_${metric}`);
-        }
-
-        // Remove duplicates and prioritize exact prefix tables
-        tableCandidates = Array.from(new Set(tableCandidates)).filter(t => dbTables.includes(t));
-
-        let rows: any[] = [];
-
-        // Attempt A: Query using candidate tables
-        for (const tbl of tableCandidates) {
-          if (rows.length > 0) break;
-
-          try {
-            const [tblColsRaw] = await connection.execute(`SHOW COLUMNS FROM \`${tbl}\``);
-            const tblCols = (Array.isArray(tblColsRaw) ? tblColsRaw : []).map(c => (c && c.Field) ? String(c.Field).toLowerCase() : '').filter(Boolean);
-
-            const valCol = tblCols.find(c => ['value', 'score', 'amount', 'stat', 'kills', 'balance', 'money', 'deaths', 'hours'].includes(c)) || tblCols[1] || 'value';
-            const nameColInTbl = tblCols.find(c => ['name', 'namecache', 'username', 'player', 'player_name'].includes(c));
-
-            // A1. Try INNER JOIN extrasTable if available
-            if (extrasTable) {
-              const foreignKey = tblCols.find(c => ['id', 'uuid', 'player_id', 'user_id'].includes(c)) || 'id';
-              try {
-                const [jRows] = await connection.execute(
-                  `SELECT e.\`${extrasNameCol}\` AS username, s.\`${valCol}\` AS value 
-                   FROM \`${tbl}\` s 
-                   INNER JOIN \`${extrasTable}\` e ON s.\`${foreignKey}\` = e.\`${extrasIdCol}\` 
-                   ORDER BY (s.\`${valCol}\` + 0) DESC LIMIT ${limit}`
-                );
-                if (Array.isArray(jRows) && jRows.length > 0) {
-                  rows = jRows;
-                  console.log(`MySQL Leaderboard Success: Joined ${tbl} with ${extrasTable}`);
-                  break;
-                }
-              } catch (e) {
-                // Ignore join error and try direct
-              }
-            }
-
-            // A2. Direct query on board table if it has player name directly
-            if (rows.length === 0 && nameColInTbl) {
-              try {
-                const [dRows] = await connection.execute(
-                  `SELECT \`${nameColInTbl}\` AS username, \`${valCol}\` AS value 
-                   FROM \`${tbl}\` 
-                   ORDER BY (\`${valCol}\` + 0) DESC LIMIT ${limit}`
-                );
-                if (Array.isArray(dRows) && dRows.length > 0) {
-                  rows = dRows;
-                  console.log(`MySQL Leaderboard Success: Direct query on ${tbl}`);
-                  break;
-                }
-              } catch (e) {
-                // Ignore query error
-              }
-            }
-          } catch (e) {
-            // Table inspection or query failed, try next
-          }
-        }
-
-        // Attempt B: Unified table (e.g. `ajlb` or `ajleaderboards` with a `board` or `type` column)
-        if (rows.length === 0) {
-          const unifiedTables = dbTables.filter(t => /^ajlb$|^ajleaderboards$|^ajleaderboard$/i.test(t) || t.toLowerCase().includes('leaderboard'));
-          for (const uTbl of unifiedTables) {
-            if (rows.length > 0) break;
-            try {
-              const [uColsRaw] = await connection.execute(`SHOW COLUMNS FROM \`${uTbl}\``);
-              const uCols = (Array.isArray(uColsRaw) ? uColsRaw : []).map(c => (c && c.Field) ? String(c.Field).toLowerCase() : '').filter(Boolean);
-              
-              const boardCol = uCols.find(c => ['board', 'type', 'stat', 'metric', 'category'].includes(c));
-              const nameCol = uCols.find(c => ['name', 'namecache', 'username', 'player'].includes(c)) || 'name';
-              const valCol = uCols.find(c => ['value', 'score', 'amount'].includes(c)) || 'value';
-
-              if (boardCol) {
-                for (const kw of targetKeywords) {
-                  try {
-                    const [uRows] = await connection.execute(
-                      `SELECT \`${nameCol}\` AS username, \`${valCol}\` AS value 
-                       FROM \`${uTbl}\` 
-                       WHERE \`${boardCol}\` LIKE ? 
-                       ORDER BY (\`${valCol}\` + 0) DESC LIMIT ${limit}`,
-                      [`%${kw}%`]
-                    );
-                    if (Array.isArray(uRows) && uRows.length > 0) {
-                      rows = uRows;
-                      console.log(`MySQL Leaderboard Success: Unified table ${uTbl} filtering board LIKE %${kw}%`);
-                      break;
-                    }
-                  } catch (e) {}
-                }
-              }
-            } catch (e) {
-              // Ignore
-            }
-          }
-        }
-
-        if (rows && rows.length > 0) {
-          mysqlData = rows.map((r: any, idx: number) => ({
-            rank: idx + 1,
-            username: String(r.username || `Player${idx + 1}`),
-            value: Number(r.value || 0)
-          }));
-        }
-        } catch (err: any) {
-          console.log("MySQL connection error:", err?.message);
-          connected = false;
-        } finally {
-          if (connection) {
-            try {
-              if (typeof connection.destroy === 'function') {
-                connection.destroy();
-              } else if (typeof connection.end === 'function') {
-                await connection.end();
-              }
-            } catch {}
-          }
-        }
-      };
-
-      const timeoutPromise = new Promise((resolve) => setTimeout(resolve, 2000));
-      await Promise.race([queryMysql(), timeoutPromise]);
+      }
     }
   } catch (err: any) {
-    console.error("Leaderboard fetch error:", err);
+    console.warn("Supabase query fallback to MySQL:", err?.message);
   }
 
-  // Fallback calculation if MySQL wasn't connected or returned no records
-  if (!connected || mysqlData.length === 0) {
-    try {
-      const realPlayersSet = new Set<string>();
-
-      realPlayersSet.add("knightsoul14323");
-      realPlayersSet.add("VortexManager");
-      realPlayersSet.add("CodeNinja");
-
-      const [purchasesList, staffList, ordersList] = await Promise.all([
-        getCollection('purchases'),
-        getCollection('staff'),
-        getCollection('orders')
-      ]);
-
-      if (Array.isArray(purchasesList)) {
-        purchasesList.forEach((p: any) => {
-          if (p.username && typeof p.username === 'string' && p.username.trim()) {
-            realPlayersSet.add(p.username.trim());
-          }
-        });
-      }
-
-      if (Array.isArray(staffList)) {
-        staffList.forEach((s: any) => {
-          if (s.ign && typeof s.ign === 'string' && s.ign.trim()) {
-            realPlayersSet.add(s.ign.trim());
-          }
-        });
-      }
-
-      if (Array.isArray(ordersList)) {
-        ordersList.forEach((o: any) => {
-          if (o.ign && typeof o.ign === 'string' && o.ign.trim()) {
-            realPlayersSet.add(o.ign.trim());
-          }
-        });
-      }
-
-      ["dream", "steve", "alex", "notorious", "herobrine", "dinnerbone", "ShadowPvP", "EnderKing", "DragonSlayer"].forEach(p => realPlayersSet.add(p));
-
-      const allPlayers = Array.from(realPlayersSet);
-
-      const playerWeights: Record<string, { playtime: number; kills: number; balance: number; deaths: number }> = {
-        "knightsoul14323": { playtime: 342.5, kills: 1420, balance: 540000, deaths: 98 },
-        "dream": { playtime: 289.0, kills: 1280, balance: 420000, deaths: 65 },
-        "VortexManager": { playtime: 245.8, kills: 980, balance: 290000, deaths: 140 },
-        "CodeNinja": { playtime: 210.2, kills: 845, balance: 385000, deaths: 185 },
-        "alex": { playtime: 185.5, kills: 620, balance: 215000, deaths: 275 },
-        "steve": { playtime: 164.0, kills: 512, balance: 180000, deaths: 310 },
-        "notorious": { playtime: 142.3, kills: 710, balance: 145000, deaths: 220 },
-        "herobrine": { playtime: 118.5, kills: 430, balance: 120000, deaths: 412 },
-        "dinnerbone": { playtime: 95.2, kills: 380, balance: 95000, deaths: 380 },
-        "ShadowPvP": { playtime: 84.0, kills: 1150, balance: 110000, deaths: 115 },
-        "EnderKing": { playtime: 72.1, kills: 520, balance: 78000, deaths: 350 },
-        "DragonSlayer": { playtime: 65.4, kills: 490, balance: 65000, deaths: 190 }
-      };
-
-      const calculatedList = allPlayers.map((player) => {
-        const pLower = player.toLowerCase();
-        let stats = playerWeights[player] || playerWeights[pLower];
-        if (!stats) {
-          let hash = 0;
-          for (let i = 0; i < player.length; i++) {
-            hash = (hash << 5) - hash + player.charCodeAt(i);
-            hash |= 0;
-          }
-          const absHash = Math.abs(hash);
-          stats = {
-            playtime: 15 + (absHash % 120),
-            kills: 50 + (absHash % 600),
-            balance: 5000 + (absHash % 150000),
-            deaths: 10 + (absHash % 250)
-          };
-        }
-
-        const value = metric === 'playtime' ? stats.playtime 
-                    : metric === 'kills' ? stats.kills 
-                    : metric === 'balance' ? stats.balance 
-                    : stats.deaths;
-
-        return { username: player, value };
+  // 2. Second attempt: Fetch live data directly from MySQL using sync service
+  try {
+    const rawTables = await executeReadOnlyQuery('SHOW TABLES');
+    const dbTables = rawTables.map(r => (r ? String(Object.values(r)[0] || '') : '')).filter(Boolean);
+    
+    if (dbTables.length === 0) {
+      return res.json({
+        success: true,
+        metric,
+        data: [],
+        connected: false,
+        source: 'none',
+        message: 'No tables found in MySQL database'
       });
-
-      calculatedList.sort((a, b) => b.value - a.value);
-
-      mysqlData = calculatedList.slice(0, limit).map((r, idx) => ({
-        rank: idx + 1,
-        username: r.username,
-        value: r.value
-      }));
-    } catch (fallbackErr) {
-      console.error("Fallback leaderboard calculation error:", fallbackErr);
     }
-  }
 
-  return res.json({ metric, data: mysqlData, connected });
+    const result = await fetchMetricLeaderboard(metric, dbTables, limit);
+    const formatted = result.players.map((p, idx) => ({
+      rank: p.rank || idx + 1,
+      username: p.name,
+      value: p.score,
+      uuid: p.uuid
+    }));
+
+    return res.json({
+      success: true,
+      metric,
+      data: formatted,
+      connected: true,
+      source: 'mysql'
+    });
+  } catch (err: any) {
+    console.error(`Leaderboard fetch error for metric "${metric}":`, err?.message);
+    return res.status(500).json({
+      success: false,
+      error: err?.message || `Failed to fetch leaderboard records for metric "${metric}"`,
+      metric,
+      data: [],
+      connected: false
+    });
+  }
 });
 
 let lastSyncStatus: any = {

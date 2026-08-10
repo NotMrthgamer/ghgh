@@ -2,6 +2,9 @@ import { loadConfig } from './src/sync/config.js';
 import { runSyncCycle } from './src/sync/sync.js';
 import { getHealthReport, getDetailedStatusReport } from './src/sync/health.js';
 import { inspectAjlbReport, inspectDatabase } from './src/sync/database-inspector.js';
+import { fetchMetricLeaderboard } from './src/sync/leaderboard.js';
+import { executeReadOnlyQuery } from './src/sync/mysql.js';
+import { getSupabaseClient } from './src/sync/supabase.js';
 import { SyncLogger } from './src/sync/logger.js';
 
 export {
@@ -9,7 +12,10 @@ export {
   getHealthReport,
   getDetailedStatusReport,
   inspectAjlbReport,
-  inspectDatabase
+  inspectDatabase,
+  fetchMetricLeaderboard,
+  executeReadOnlyQuery,
+  getSupabaseClient
 };
 
 // Check if running as main CLI script

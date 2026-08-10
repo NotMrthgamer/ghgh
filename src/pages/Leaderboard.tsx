@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useSettings } from '../context/SettingsContext';
 import { Trophy, Clock, Skull, Coins, Award, Pickaxe, Flame, Vote, Search, RefreshCw, ChevronLeft, ChevronRight, Terminal, CheckCircle2, ShieldCheck, Sparkles, X } from 'lucide-react';
 import { cn } from '../lib/utils';
+import { fetchJson } from '../lib/fetchJson';
 
 interface LeaderboardEntry {
   rank: number;
@@ -48,12 +49,10 @@ export default function Leaderboard() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/leaderboard/${metric}?limit=200`);
-      const json = await res.json();
-
-      if (res.ok && json) {
+      const json = await fetchJson(`/api/leaderboard/${metric}?limit=200`);
+      if (json && json.data) {
         setData(json.data || []);
-        setConnected(json.connected || false);
+        setConnected(json.connected ?? true);
       } else {
         setError(json?.error || 'Failed to load leaderboard records');
       }
@@ -78,9 +77,8 @@ export default function Leaderboard() {
     setSyncing(true);
     setLastSyncMsg(null);
     try {
-      const res = await fetch('/api/sync/supabase', { method: 'POST' });
-      const json = await res.json();
-      if (res.ok && json.success) {
+      const json = await fetchJson('/api/sync/supabase', { method: 'POST' });
+      if (json && json.success) {
         setLastSyncMsg(`Synced ${json.recordsSynced || 0} records across ${json.metricsProcessed || 0} metrics.`);
         fetchLeaderboard(activeTab);
       } else {
